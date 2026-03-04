@@ -1,0 +1,135 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      upstream_repository:
+        description: "Upstream repository in owner/repo format"
+        required: false
+        default: "super-linter/super-linter"
+      upstream_branch:
+        description: "Upstream branch to sync from"
+        required: false
+        default: "main"
+      target_branch:
+        description: "Fork branch to sync into"
+        required: false
+        default: "main"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set sync parameters
+        id: params
+        shell: bash
+        run: |
+          set -euo pipefail
+          upstream_repo="${{ inputs.upstream_repository }}"
+          upstream_branch="${{ inputs.upstream_branch }}"
+          target_branch="${{ inputs.target_branch }}"
+
+          if [[ -z "${upstream_repo}" ]]; then upstream_repo="super-linter/super-linter"; fi
+          if [[ -z "${upstream_branch}" ]]; then upstream_branch="main"; fi
+          if [[ -z "${target_branch}" ]]; then target_branch="main"; fi
+
+          sync_branch="chore/sync-upstream-${upstream_branch}"
+
+          echo "upstream_repo=${upstream_repo}" >> "${GITHUB_OUTPUT}"
+          echo "upstream_branch=${upstream_branch}" >> "${GITHUB_OUTPUT}"
+          echo "target_branch=${target_branch}" >> "${GITHUB_OUTPUT}"
+          echo "sync_branch=${sync_branch}" >> "${GITHUB_OUTPUT}"
+
+      - name: Fetch upstream and compare
+        id: compare
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${{ steps.params.outputs.upstream_repo }}.git" || true
+          git fetch --prune origin
+          git fetch --prune upstream "${{ steps.params.outputs.upstream_branch }}"
+
+          origin_sha="$(git rev-parse "origin/${{ steps.params.outputs.target_branch }}")"
+          upstream_sha="$(git rev-parse "upstream/${{ steps.params.outputs.upstream_branch }}")"
+
+          echo "origin_sha=${origin_sha}" >> "${GITHUB_OUTPUT}"
+          echo "upstream_sha=${upstream_sha}" >> "${GITHUB_OUTPUT}"
+
+          if [[ "${origin_sha}" == "${upstream_sha}" ]]; then
+            echo "needs_sync=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "needs_sync=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Prepare sync branch
+        if: steps.compare.outputs.needs_sync == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git checkout -B "${{ steps.params.outputs.sync_branch }}" "upstream/${{ steps.params.outputs.upstream_branch }}"
+          git push --force --set-upstream origin "${{ steps.params.outputs.sync_branch }}"
+
+      - name: Create or update pull request
+        if: steps.compare.outputs.needs_sync == 'true'
+        uses: actions/github-script@v8
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const headBranch = `${owner}:${{ steps.params.outputs.sync_branch }}`;
+            const baseBranch = `${{ steps.params.outputs.target_branch }}`;
+
+            const existing = await github.rest.pulls.list({
+              owner,
+              repo,
+              state: "open",
+              head: headBranch,
+              base: baseBranch,
+            });
+
+            const body = [
+              "Automated upstream sync PR.",
+              "",
+              `- Upstream: \`${{ steps.params.outputs.upstream_repo }}@${{ steps.params.outputs.upstream_branch }}\``,
+              `- Target branch: \`${{ steps.params.outputs.target_branch }}\``,
+              `- Upstream SHA: \`${{ steps.compare.outputs.upstream_sha }}\``,
+              `- Current target SHA: \`${{ steps.compare.outputs.origin_sha }}\``,
+            ].join("\n");
+
+            if (existing.data.length > 0) {
+              const pr = existing.data[0];
+              await github.rest.pulls.update({
+                owner,
+                repo,
+                pull_number: pr.number,
+                title: `chore: sync upstream (${{ steps.params.outputs.upstream_branch }} -> ${{ steps.params.outputs.target_branch }})`,
+                body,
+              });
+              core.info(`Updated existing PR #${pr.number}`);
+            } else {
+              const pr = await github.rest.pulls.create({
+                owner,
+                repo,
+                title: `chore: sync upstream (${{ steps.params.outputs.upstream_branch }} -> ${{ steps.params.outputs.target_branch }})`,
+                head: `${{ steps.params.outputs.sync_branch }}`,
+                base: baseBranch,
+                body,
+              });
+              core.info(`Created PR #${pr.data.number}`);
+            }
+
+      - name: No changes to sync
+        if: steps.compare.outputs.needs_sync != 'true'
+        run: echo "Fork is already up to date with upstream."
